@@ -180,6 +180,8 @@ class MeritMemory:
             return []
 
     def _get_frame_count(self, rank: int, round_num: int) -> int:
+        if os.environ.get("MERIT_NO_FRAMES") == "1":     # memory-only answering (epic v3 M2 probes)
+            return 0
         if round_num == 1:
             return 6
         elif round_num == 2:

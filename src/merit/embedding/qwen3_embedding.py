@@ -1,6 +1,7 @@
 from typing import List, Union
 
 import numpy as np
+from huggingface_hub import snapshot_download
 from sentence_transformers import SentenceTransformer
 
 
@@ -12,6 +13,11 @@ class Qwen3EmbeddingModel:
     ):
         self.model_name = model_name
         self.device = device
+        # Local snapshot when cached (transformers 4.57 hits the Hub API for hub ids, even offline).
+        try:
+            model_name = snapshot_download(model_name, local_files_only=True)
+        except Exception:
+            pass
 
         # flash_attention_2 only works on CUDA; fall back to sdpa on CPU
         attn_impl = "sdpa" if device == "cpu" else "flash_attention_2"

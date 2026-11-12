@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from decord import cpu, VideoReader
+from huggingface_hub import snapshot_download
 from PIL import Image
 from pydantic import ValidationError
 from qwen_vl_utils import process_vision_info
@@ -25,6 +26,7 @@ if not hasattr(_act, "PytorchGELUTanh") and hasattr(_act, "GELUTanh"):
     _act.PytorchGELUTanh = _act.GELUTanh
 
 from transformers import (
+    AutoModelForImageTextToText,
     AutoProcessor,
     Qwen2_5_VLForConditionalGeneration,
     Qwen3VLForConditionalGeneration,
@@ -44,6 +46,8 @@ MODEL_DICT = {
     "qwen3vl-8b": "Qwen/Qwen3-VL-8B-Instruct",
     "qwen3vl-30b": "Qwen/Qwen3-VL-30B-A3B-Instruct",
     "qwen3vl-32b": "Qwen/Qwen3-VL-32B-Instruct",
+    # Qwen3.8 (model type qwen3_5, needs transformers 5): run in instruct mode (enable_thinking=False in generate)
+    "qwen38-27b": "Qwen/Qwen3.8-27B",
     # Qwen2.5-VL series
     "qwen25vl-7b": "Qwen/Qwen2.5-VL-7B-Instruct",
     "qwen25vl-32b-awq": "Qwen/Qwen2.5-VL-32B-Instruct-AWQ",
@@ -111,7 +115,8 @@ class Qwen3VLModel:
         self.nframes = nframes
 
         # Extract device configuration so it is not passed to generate
-        self.device_map = kwargs.pop("device_map", kwargs.pop("device", "cuda:0"))
+        # MERIT_DEVICE_MAP=auto spreads a model too big for one GPU (Qwen3.8-27B) over all visible ones
+        self.device_map = kwargs.pop("device_map", kwargs.pop("device", os.environ.get("MERIT_DEVICE_MAP", "cuda:0")))
         
         # Filter out GPT-specific arguments that might be passed from LLMModel
         kwargs.pop("service_tier", None)
@@ -174,7 +179,9 @@ class Qwen3VLModel:
     def _init_model(self) -> None:
         """Initialize the model and processor."""
         # Select model class based on model name
-        if "Qwen2.5-VL" in self.model_name:
+        if "Qwen3.8" in self.model_name:
+            model_cls = AutoModelForImageTextToText
+        elif "Qwen2.5-VL" in self.model_name:
             model_cls = Qwen2_5_VLForConditionalGeneration
         elif "MoE" in self.model_name or "A3B" in self.model_name:
             model_cls = Qwen3VLMoeForConditionalGeneration
@@ -213,15 +220,33 @@ class Qwen3VLModel:
                 full_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
                 # GPU 0: small limit (vision encoder ~3-5GB only)
                 # Other GPUs: large limit for transformer layers
-                gpu0_limit = f"{int(full_mem * 0.25)}GiB"
+                # MERIT_GPU0_FRAC: a model near the GPUs' total size (Qwen3.8-27B on 2x 48 GB) needs more
+                # of GPU 0 than 25%, or it spills to disk
+                gpu0_limit = f"{int(full_mem * float(os.environ.get('MERIT_GPU0_FRAC', 0.25)))}GiB"
                 other_limit = f"{int(full_mem * 0.9)}GiB"
                 max_memory = {0: gpu0_limit}
                 for i in range(1, num_gpus):
                     max_memory[i] = other_limit
+                # On 3+ GPUs the eval puts the embedding model (~8 GB) on the last one: cap that GPU at 40%
+                # (Qwen3.8-27B on 4x A5000: 11 / 16.3 / 16.3 / 7.3 GB, checked with infer_auto_device_map)
+                if num_gpus > 2:
+                    max_memory[num_gpus - 1] = f"{int(full_mem * 0.4)}GiB"
+                    # and leave 25% of the middle ones free: loading briefly needs ~4.7 GiB more on a GPU
+                    for i in range(1, num_gpus - 1):
+                        max_memory[i] = f"{int(full_mem * 0.75)}GiB"
                 load_kwargs["max_memory"] = max_memory
+                # "auto" balances layers across GPUs and only then caps them, which pushed Qwen3.8-27B to
+                # disk on 4x A5000; "sequential" fills GPU 0, 1, ... up to their caps and leaves the last free
+                load_kwargs["device_map"] = "sequential"
                 logger.info(f"Multi-GPU max_memory: {max_memory}")
 
-        self.model = model_cls.from_pretrained(self.model_name, **load_kwargs)
+        # Load from the local snapshot when cached: transformers 4.57 queries the Hub API
+        # for tokenizers loaded by hub id, which fails under HF_HUB_OFFLINE.
+        try:
+            model_path = snapshot_download(self.model_name, local_files_only=True)
+        except Exception:
+            model_path = self.model_name
+        self.model = model_cls.from_pretrained(model_path, **load_kwargs)
 
         # Log device distribution
         if hasattr(self.model, "hf_device_map"):
@@ -231,7 +256,7 @@ class Qwen3VLModel:
             logger.info(f"Model on device: {self.model.device}")
 
         # Load processor
-        self.processor = AutoProcessor.from_pretrained(self.model_name)
+        self.processor = AutoProcessor.from_pretrained(model_path)
 
     def _validate_file_path(self, file_path: Union[str, Path]) -> Path:
         """Validate and convert file path to Path object."""
@@ -507,7 +532,9 @@ class Qwen3VLModel:
         try:
             # Prepare text for Qwen3VL processor
             text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages, tokenize=False, add_generation_prompt=True,
+                # Qwen3.8 thinks by default; MERIT runs it in instruct mode
+                **({"enable_thinking": False} if "Qwen3.8" in self.model_name else {}),
             )
 
             # Process vision info (images and videos)
